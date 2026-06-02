@@ -3487,3 +3487,2461 @@ spec:
   # DNS allow (ZAROORI!)
   - to:
     - namespace
+
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: api                       # Ye policy api pods pe apply hogi
+
+  policyTypes:
+  - Ingress
+  - Egress
+
+  ingress:
+  # Sirf frontend pods se traffic allow karo
+  - from:
+    - podSelector:
+        matchLabels:
+          app: frontend
+    ports:
+    - protocol: TCP
+      port: 3000
+
+  # Specific namespace se bhi allow karo
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          environment: production
+      podSelector:                   # AND condition (dono match karne chahiye)
+        matchLabels:
+          app: frontend
+
+  # External IP range se allow karo
+  - from:
+    - ipBlock:
+        cidr: 10.0.0.0/8
+        except:
+        - 10.0.1.0/24               # Ye subnet exclude karo
+
+  egress:
+  # Sirf database ko connect karne do
+  - to:
+    - podSelector:
+        matchLabels:
+          app: postgres
+    ports:
+    - protocol: TCP
+      port: 5432
+
+  # Redis access allow karo
+  - to:
+    - podSelector:
+        matchLabels:
+          app: redis
+    ports:
+    - protocol: TCP
+      port: 6379
+
+  # DNS allow karo (ZAROORI! Warna name resolution fail hogi)
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+
+  # External APIs allow karo
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+        - 10.0.0.0/8               # Internal network block karo
+    ports:
+    - protocol: TCP
+      port: 443
+
+---
+# ============================================
+# COMPLETE MICRO-SEGMENTATION EXAMPLE
+# ============================================
+
+# Frontend — Sirf ingress controller se traffic le, api ko de
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frontend-policy
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: frontend
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          app: api
+    ports:
+    - port: 3000
+  - to:                             # DNS
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+    ports:
+    - port: 53
+      protocol: UDP
+
+---
+# Database — Sirf api aur migration jobs se connections accept karo
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: database-policy
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchExpressions:
+        - key: app
+          operator: In
+          values: ["api", "migration"]
+    ports:
+    - port: 5432
+```
+
+```bash
+kubectl get networkpolicies (netpol)
+kubectl get netpol -n production
+kubectl describe netpol api-network-policy -n production
+
+# Test connectivity
+kubectl run test-pod --image=busybox --rm -it --restart=Never -- \
+  wget -qO- http://api-service:3000/health
+```
+
+### 🎯 Interview Answer
+**Q: What are Network Policies in Kubernetes and why are they important?**
+
+By default, all pods can communicate with all other pods across namespaces — this is a security risk. NetworkPolicy acts as a firewall, defining ingress and egress rules based on pod/namespace selectors and IP blocks. Start with a **default-deny-all** policy, then explicitly allow required traffic. Important: NetworkPolicy requires a **CNI plugin that supports it** (Calico, Cilium, Weave Net — Flannel does NOT support). Always include DNS egress (port 53 UDP) otherwise name resolution breaks. Use micro-segmentation: frontend → api → database, with each layer only able to communicate with adjacent layers.
+
+---
+
+## Chapter 25: Horizontal Pod Autoscaler (HPA)
+
+> 🔗 Related: [Deployments](#chapter-10-deployments) | [Resource Requests & Limits](#chapter-16-resource-requests--limits) | [VPA](#chapter-26-vertical-pod-autoscaler-vpa)
+
+### 🇮🇳 Hindi Explanation
+**HPA** automatically deployment/statefulset ke pods ki **count** badha ya ghata deta hai load ke basis pe.
+
+**Requirements:**
+- **Metrics Server** install hona chahiye (CPU/Memory metrics ke liye)
+- Pods mein **resource requests** set honi chahiye
+
+```yaml
+# ============================================
+# HPA — CPU & Memory based
+# ============================================
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: myapp-hpa
+  namespace: production
+
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: myapp-deployment
+
+  minReplicas: 2
+  maxReplicas: 20
+
+  metrics:
+  # CPU based scaling
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70       # 70% CPU pe scale out
+
+  # Memory based scaling
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: AverageValue
+        averageValue: 400Mi          # 400Mi average pe scale out
+
+  # Custom metric (Pods)
+  - type: Pods
+    pods:
+      metric:
+        name: requests_per_second
+      target:
+        type: AverageValue
+        averageValue: "1000"         # 1000 RPS per pod pe scale
+
+  # External metric (SQS queue length, etc.)
+  - type: External
+    external:
+      metric:
+        name: queue_messages_visible
+        selector:
+          matchLabels:
+            queue: myapp-queue
+      target:
+        type: AverageValue
+        averageValue: "30"           # 30 messages per pod
+
+  # Object metric (Ingress RPS)
+  - type: Object
+    object:
+      metric:
+        name: requests-per-second
+      describedObject:
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        name: myapp-ingress
+      target:
+        type: Value
+        value: "10k"
+
+  # ============================================
+  # SCALING BEHAVIOR (Fine-grained control)
+  # ============================================
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300    # 5 min stabilize karo scale down se pehle
+      policies:
+      - type: Percent
+        value: 10                         # Max 10% pods per period ghata sako
+        periodSeconds: 60
+      - type: Pods
+        value: 2                          # Ya max 2 pods per period
+        periodSeconds: 60
+      selectPolicy: Min                   # Min = conservative (dono mein se chhota)
+
+    scaleUp:
+      stabilizationWindowSeconds: 0      # Immediately scale up
+      policies:
+      - type: Percent
+        value: 100                        # Max 100% pods double karo per period
+        periodSeconds: 15
+      - type: Pods
+        value: 4                          # Ya max 4 pods per period
+        periodSeconds: 15
+      selectPolicy: Max                   # Max = aggressive (dono mein se bada)
+```
+
+```bash
+# Metrics Server install karo
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+# HPA commands
+kubectl autoscale deployment myapp \
+  --cpu-percent=70 \
+  --min=2 \
+  --max=10
+kubectl get hpa
+kubectl get hpa -n production
+kubectl describe hpa myapp-hpa
+kubectl get hpa myapp-hpa --watch    # Live scaling dekho
+
+# Current metrics
+kubectl top pods -n production
+kubectl top nodes
+
+# HPA delete
+kubectl delete hpa myapp-hpa
+```
+
+### 🎯 Interview Answer
+**Q: How does HPA work in Kubernetes?**
+
+HPA (Horizontal Pod Autoscaler) watches metrics (CPU, memory, custom) and scales the number of pod replicas up or down. It queries **Metrics Server** (or custom metrics adapter) every 15 seconds. Scale-up formula: `desiredReplicas = ceil(currentReplicas * (currentMetric / desiredMetric))`. Example: 3 pods at 90% CPU, target 70% → `ceil(3 * 90/70)` = 4 pods. **Scale-down** has a stabilization window (default 5 min) to prevent flapping. Requirements: pods must have resource requests set (HPA calculates utilization against requests). For production: always set both minReplicas (for baseline availability) and maxReplicas (cost control), and configure scale-down behavior to avoid premature downscaling.
+
+---
+
+## Chapter 26: Vertical Pod Autoscaler (VPA)
+
+> 🔗 Related: [HPA](#chapter-25-horizontal-pod-autoscaler-hpa) | [Resource Requests & Limits](#chapter-16-resource-requests--limits)
+
+### 🇮🇳 Hindi Explanation
+**VPA** pods ke **CPU/Memory requests aur limits** automatically adjust karta hai. Pod count nahi badhata — resources badhata/ghataata hai.
+
+**HPA vs VPA:**
+- **HPA** = More pods (horizontal scaling)
+- **VPA** = Bigger pods (vertical scaling)
+- **Dono saath use karo** lekin CPU pe nahi (conflict) — sirf memory pe VPA + CPU pe HPA
+
+```yaml
+# VPA install karo
+# git clone https://github.com/kubernetes/autoscaler.git
+# ./autoscaler/vertical-pod-autoscaler/hack/vpa-up.sh
+
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: myapp-vpa
+  namespace: production
+
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: myapp-deployment
+
+  updatePolicy:
+    updateMode: "Auto"               # Off | Initial | Recreate | Auto
+    # Off: Sirf recommendations, changes nahi
+    # Initial: Sirf naye pods pe apply
+    # Recreate: Pods recreate karke apply
+    # Auto: Best effort (currently = Recreate)
+
+  resourcePolicy:
+    containerPolicies:
+    - containerName: myapp
+      minAllowed:
+        cpu: 50m
+        memory: 64Mi
+      maxAllowed:
+        cpu: "4"
+        memory: 4Gi
+      controlledResources: ["cpu", "memory"]
+      controlledValues: RequestsAndLimits  # RequestsOnly | RequestsAndLimits
+```
+
+```bash
+kubectl get vpa -n production
+kubectl describe vpa myapp-vpa -n production
+# Recommendations section mein dekho:
+# Lower Bound, Upper Bound, Target (recommended)
+
+# VPA recommendation check karo (Off mode)
+kubectl get vpa myapp-vpa -o yaml | grep -A 20 recommendation
+```
+
+---
+
+## Chapter 27: Cluster Autoscaler
+
+> 🔗 Related: [HPA](#chapter-25-horizontal-pod-autoscaler-hpa) | [Nodes](#chapter-2-kubernetes-architecture)
+
+### 🇮🇳 Hindi Explanation
+**Cluster Autoscaler** **nodes** automatically add ya remove karta hai:
+- **Scale Up:** Pods pending hain (resources nahi hain) → Naya node add karo
+- **Scale Down:** Node underutilized hai (10 min se) → Node remove karo, pods migrate karo
+
+```yaml
+# AWS EKS pe Cluster Autoscaler
+# 1. IAM policy create karo
+# 2. Service account annotate karo
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cluster-autoscaler
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: cluster-autoscaler
+  template:
+    metadata:
+      labels:
+        app: cluster-autoscaler
+      annotations:
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    spec:
+      serviceAccountName: cluster-autoscaler
+      containers:
+      - image: registry.k8s.io/autoscaling/cluster-autoscaler:v1.29.0
+        name: cluster-autoscaler
+        command:
+        - ./cluster-autoscaler
+        - --v=4
+        - --stderrthreshold=info
+        - --cloud-provider=aws
+        - --skip-nodes-with-local-storage=false
+        - --expander=least-waste       # least-waste | random | most-pods | price
+        - --node-group-auto-discovery=asg:tag=k8s.io/cluster-autoscaler/enabled,k8s.io/cluster-autoscaler/my-cluster
+        - --balance-similar-node-groups
+        - --scale-down-enabled=true
+        - --scale-down-delay-after-add=10m
+        - --scale-down-unneeded-time=10m
+        - --scale-down-utilization-threshold=0.5
+        - --max-node-provision-time=15m
+```
+
+```bash
+# Cluster Autoscaler logs
+kubectl logs -l app=cluster-autoscaler -n kube-system -f
+
+# Annotations for safe eviction
+kubectl annotate pod mypod \
+  cluster-autoscaler.kubernetes.io/safe-to-evict="true"
+
+# Node group status
+kubectl describe cm cluster-autoscaler-status -n kube-system
+```
+
+---
+
+## Chapter 28: Pod Disruption Budget (PDB)
+
+> 🔗 Related: [Deployments](#chapter-10-deployments) | [Cluster Upgrades](#chapter-34-cluster-upgrades--maintenance)
+
+### 🇮🇳 Hindi Explanation
+**PDB** ensure karta hai ki **voluntary disruptions** (node drain, rolling updates, cluster upgrades) ke dauran minimum available pods maintain ho. Involuntary disruptions (node crash) pe apply nahi hota.
+
+**Voluntary disruptions:** Node drain, rolling update, cluster upgrade
+**Involuntary disruptions:** Node hardware failure, OOMKill — PDB control nahi karta
+
+```yaml
+# ============================================
+# PDB — minAvailable
+# ============================================
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: myapp-pdb
+  namespace: production
+
+spec:
+  # Option 1: Minimum available pods
+  minAvailable: 2                    # Hamesha 2 pods available hone chahiye
+  # minAvailable: "50%"             # Ya percentage
+
+  # Option 2: Maximum unavailable pods
+  # maxUnavailable: 1               # Ek waqt mein max 1 pod unavailable
+  # maxUnavailable: "25%"           # Ya percentage
+
+  selector:
+    matchLabels:
+      app: myapp
+
+---
+# Practical example: 3 replicas hain
+# PDB: minAvailable: 2
+# → Drain ke waqt sirf 1 pod evict hoga at a time
+# → Pehle 2 pods available honge tab 3rd evict hoga
+
+# PDB: maxUnavailable: 1
+# → Same effect — ek waqt mein max 1 pod down
+```
+
+```bash
+kubectl get pdb -n production
+kubectl get poddisruptionbudgets -n production
+kubectl describe pdb myapp-pdb -n production
+# Shows: Allowed disruptions, Current pods, Desired healthy
+
+# Test karo
+kubectl drain worker-1 --ignore-daemonsets --delete-emptydir-data
+# PDB violate hoga toh drain wait karega
+```
+
+### 🎯 Interview Answer
+**Q: What is a PodDisruptionBudget and why is it important?**
+
+PDB ensures high availability during **voluntary disruptions** by setting minimum available or maximum unavailable pods. Without PDB, during node drain or cluster upgrade, K8s might evict all pods of a deployment simultaneously. With `minAvailable: 2` on a 3-replica deployment, K8s ensures at least 2 pods are always running — it will wait before evicting the 3rd until one of the evicted pods reschedules elsewhere. Critical for: cluster upgrades (rolling node upgrades), node maintenance, Cluster Autoscaler scale-down. Always set PDB for production deployments with 2+ replicas.
+
+---
+
+## Chapter 29: Helm — Package Manager
+
+> 🔗 Related: [Deployments](#chapter-10-deployments) | [ConfigMaps & Secrets](#chapter-13-configmaps--secrets)
+
+### 🇮🇳 Hindi Explanation
+**Helm** Kubernetes ka **package manager** hai — `apt`, `yum`, `npm` jaise. Complex applications ek command mein deploy karo.
+
+**Key concepts:**
+- **Chart** — Package (templates + default values)
+- **Release** — Deployed chart instance (ek chart multiple baar deploy ho sakta hai)
+- **Repository** — Charts ka store (Artifact Hub)
+- **Values** — Configuration jo templates mein inject hoti hai
+
+```bash
+# ============================================
+# HELM INSTALLATION
+# ============================================
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+helm version
+
+# ============================================
+# REPO MANAGEMENT
+# ============================================
+helm repo add bitnami https://charts.bitnami.com/bitnami
+helm repo add stable https://charts.helm.sh/stable
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo add cert-manager https://charts.jetstack.io
+helm repo add grafana https://grafana.github.io/helm-charts
+
+helm repo list
+helm repo update                     # All repos update karo
+helm repo remove stable              # Repo remove karo
+
+# ============================================
+# SEARCH
+# ============================================
+helm search repo nginx               # Installed repos mein search
+helm search repo nginx --versions    # All versions
+helm search hub prometheus           # Artifact Hub pe
+
+# ============================================
+# INSPECT CHART
+# ============================================
+helm show chart bitnami/postgresql
+helm show values bitnami/postgresql  # Default values dekho
+helm show all bitnami/postgresql     # Sab info
+
+# ============================================
+# INSTALL
+# ============================================
+# Basic install
+helm install my-nginx bitnami/nginx
+
+# Namespace mein install
+helm install my-postgres bitnami/postgresql \
+  --namespace production \
+  --create-namespace
+
+# Values override karo
+helm install my-postgres bitnami/postgresql \
+  --namespace production \
+  --create-namespace \
+  --set auth.postgresPassword=MySecurePass123 \
+  --set auth.database=myappdb \
+  --set primary.persistence.size=50Gi \
+  --set primary.resources.requests.cpu=500m \
+  --set primary.resources.requests.memory=1Gi
+
+# Values file se override karo (recommended)
+helm install my-postgres bitnami/postgresql \
+  --namespace production \
+  -f postgres-values.yaml
+
+# Multiple values files
+helm install my-app ./mychart \
+  -f base-values.yaml \
+  -f prod-values.yaml             # Later files override earlier ones
+
+# Dry run (kya deploy hoga dekho)
+helm install my-app bitnami/nginx \
+  --dry-run \
+  --debug
+
+# Specific version install
+helm install my-nginx bitnami/nginx --version 15.1.0
+
+# Wait for deployment
+helm install my-app bitnami/nginx --wait --timeout 5m
+
+# ============================================
+# RELEASE MANAGEMENT
+# ============================================
+helm list                            # All releases
+helm list -n production              # Specific namespace
+helm list -A                         # All namespaces
+helm list --failed                   # Failed releases
+helm list --deployed
+
+helm status my-postgres              # Release status
+helm history my-postgres             # Revision history
+helm get values my-postgres          # Applied values
+helm get values my-postgres --all    # All values (including defaults)
+helm get manifest my-postgres        # Generated manifests
+helm get notes my-postgres           # Release notes
+
+# ============================================
+# UPGRADE
+# ============================================
+helm upgrade my-postgres bitnami/postgresql \
+  --namespace production \
+  -f postgres-values.yaml
+
+# Install ya upgrade (exists nahi toh install)
+helm upgrade --install my-app bitnami/nginx \
+  --namespace production \
+  --create-namespace \
+  -f values.yaml
+
+# Atomic upgrade (fail pe auto rollback)
+helm upgrade my-app bitnami/nginx --atomic --timeout 5m
+
+# ============================================
+# ROLLBACK
+# ============================================
+helm rollback my-postgres            # Previous revision
+helm rollback my-postgres 3          # Specific revision
+helm rollback my-postgres 1 --wait
+
+# ============================================
+# UNINSTALL
+# ============================================
+helm uninstall my-postgres -n production
+helm uninstall my-postgres -n production --keep-history  # History rakho
+
+# ============================================
+# CUSTOM CHART BANANA
+# ============================================
+helm create mychart                  # Scaffold create karo
+
+# Chart structure:
+# mychart/
+#   Chart.yaml           → Chart metadata
+#   values.yaml          → Default values
+#   charts/              → Dependencies (subcharts)
+#   templates/           → K8s manifest templates
+#     deployment.yaml
+#     service.yaml
+#     ingress.yaml
+#     configmap.yaml
+#     _helpers.tpl        → Template helpers/partials
+#     NOTES.txt           → Install ke baad message
+#   .helmignore           → Files ignore karo
+
+helm lint mychart                    # Validate karo
+helm template mychart                # Templates render karo (dry run)
+helm template mychart --debug        # Debug output
+helm package mychart                 # .tgz package banao
+helm install test-release ./mychart  # Local chart install
+```
+
+### Custom Chart Template Example
+```yaml
+# templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mychart.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "mychart.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/chart: {{ include "mychart.chart" . }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "mychart.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mychart.selectorLabels" . | nindent 8 }}
+    spec:
+      containers:
+      - name: {{ .Chart.Name }}
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        ports:
+        - containerPort: {{ .Values.service.targetPort }}
+        {{- if .Values.resources }}
+        resources:
+          {{- toYaml .Values.resources | nindent 10 }}
+        {{- end }}
+        {{- if .Values.env }}
+        env:
+          {{- range .Values.env }}
+          - name: {{ .name }}
+            value: {{ .value | quote }}
+          {{- end }}
+        {{- end }}
+```
+
+```yaml
+# values.yaml
+replicaCount: 3
+
+image:
+  repository: myapp
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 3000
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+env:
+  - name: NODE_ENV
+    value: production
+
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+  - host: myapp.example.com
+    paths:
+    - path: /
+      pathType: Prefix
+```
+
+---
+
+## Chapter 30: DNS & Service Discovery (CoreDNS)
+
+> 🔗 Related: [Services](#chapter-11-services) | [StatefulSets](#chapter-19-statefulsets) | [Namespaces](#chapter-8-namespaces)
+
+### 🇮🇳 Hindi Explanation
+K8s mein har **Service** ka ek **DNS name** automatically ban jaata hai. **CoreDNS** ye kaam karta hai — `kube-system` namespace mein run karta hai.
+
+**DNS Format:**
+```
+<service-name>.<namespace>.svc.<cluster-domain>
+Default cluster domain: cluster.local
+
+Full FQDN: my-service.production.svc.cluster.local
+Same namespace: my-service (short form works)
+Cross namespace: my-service.production
+```
+
+```bash
+# CoreDNS pods
+kubectl get pods -n kube-system -l k8s-app=kube-dns
+kubectl logs -n kube-system -l k8s-app=kube-dns
+
+# CoreDNS ConfigMap
+kubectl get cm coredns -n kube-system -o yaml
+kubectl edit cm coredns -n kube-system
+```
+
+```yaml
+# CoreDNS Corefile
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns
+  namespace: kube-system
+data:
+  Corefile: |
+    .:53 {
+        errors
+        health {
+           lameduck 5s
+        }
+        ready
+        kubernetes cluster.local in-addr.arpa ip6.arpa {
+           pods insecure
+           fallthrough in-addr.arpa ip6.arpa
+           ttl 30
+        }
+        prometheus :9153
+        forward . /etc/resolv.conf {
+           max_concurrent 1000
+        }
+        cache 30
+        loop
+        reload
+        loadbalance
+    }
+
+    # Custom domain stub zone
+    db.company.internal:53 {
+        forward . 10.0.0.53          # Internal DNS server
+    }
+
+    # External service ke liye rewrite
+    example.com:53 {
+        forward . 8.8.8.8
+    }
+```
+
+### DNS Records Types
+```bash
+# ============================================
+# SERVICE DNS RECORDS
+# ============================================
+
+# ClusterIP Service:
+# A record: my-svc.namespace.svc.cluster.local → ClusterIP
+# SRV record: _port._proto.my-svc.namespace.svc.cluster.local
+
+# Headless Service:
+# A record: my-svc.namespace.svc.cluster.local → Pod IPs (multiple)
+# Pod individual DNS: pod-name.my-svc.namespace.svc.cluster.local
+
+# StatefulSet Pod DNS:
+# postgres-0.postgres-headless.production.svc.cluster.local
+# postgres-1.postgres-headless.production.svc.cluster.local
+
+# ============================================
+# POD DNS
+# ============================================
+# Pod IP ke dashes se:
+# 10-244-1-25.production.pod.cluster.local
+
+# ============================================
+# DNS DEBUG
+# ============================================
+# Debug pod run karo
+kubectl run dns-test --image=busybox:1.36 --rm -it --restart=Never -- sh
+
+# Inside pod:
+nslookup kubernetes                           # Default service
+nslookup my-service                           # Same namespace
+nslookup my-service.production                # Cross namespace
+nslookup my-service.production.svc.cluster.local  # FQDN
+nslookup postgres-0.postgres-headless.production  # StatefulSet pod
+
+cat /etc/resolv.conf
+# nameserver 10.96.0.10         ← CoreDNS ClusterIP
+# search production.svc.cluster.local svc.cluster.local cluster.local
+# options ndots:5
+
+# CoreDNS query logging enable karo (debug)
+kubectl edit cm coredns -n kube-system
+# log plugin add karo:
+# .:53 {
+#     log             ← Ye add karo
+#     errors
+#     ...
+# }
+
+# ndots explain:
+# ndots:5 = agar hostname mein 5 se kam dots hain toh search domains try karo
+# "postgres" → postgres.production.svc.cluster.local ✓ (found!)
+# "www.google.com" → www.google.com (4 dots → less than 5 → try search domains first)
+```
+
+### 🎯 Interview Answer
+**Q: How does DNS-based service discovery work in Kubernetes?**
+
+Kubernetes uses **CoreDNS** running as pods in kube-system namespace. When a Service is created, an **A record** is automatically created: `<service>.<namespace>.svc.cluster.local`. Each pod's `/etc/resolv.conf` is configured with: the CoreDNS ClusterIP as nameserver, and search domains (`<namespace>.svc.cluster.local`, `svc.cluster.local`, `cluster.local`). This allows pods to reach services by short name (`my-service`), namespace-qualified name (`my-service.production`), or FQDN. **Headless services** return individual Pod A records instead of ClusterIP — essential for StatefulSets where each pod needs a stable, unique DNS identity (`postgres-0.postgres-headless.production.svc.cluster.local`).
+
+---
+
+## Chapter 31: Monitoring — Prometheus & Grafana
+
+> 🔗 Related: [Resource Requests & Limits](#chapter-16-resource-requests--limits) | [HPA](#chapter-25-horizontal-pod-autoscaler-hpa)
+
+### 🇮🇳 Hindi Explanation
+**Prometheus** metrics collect karta hai, **Grafana** visualize karta hai. **kube-prometheus-stack** Helm chart dono ko saath install karta hai — sabse popular monitoring solution.
+
+```bash
+# ============================================
+# METRICS SERVER (Basic — kubectl top ke liye)
+# ============================================
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+# minikube pe
+minikube addons enable metrics-server
+
+# Verify
+kubectl top nodes
+kubectl top pods -A
+
+# ============================================
+# KUBE-PROMETHEUS-STACK (Full monitoring)
+# ============================================
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+
+# Default install
+helm install kube-prom-stack \
+  prometheus-community/kube-prometheus-stack \
+  --namespace monitoring \
+  --create-namespace
+
+# Custom values ke saath
+cat > prometheus-values.yaml << 'EOF'
+prometheus:
+  prometheusSpec:
+    retention: 15d
+    retentionSize: "10GB"
+    resources:
+      requests:
+        cpu: 500m
+        memory: 1Gi
+      limits:
+        cpu: 2000m
+        memory: 4Gi
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: fast-ssd
+          resources:
+            requests:
+              storage: 50Gi
+
+grafana:
+  adminPassword: "MySecureGrafanaPass"
+  persistence:
+    enabled: true
+    size: 10Gi
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    hosts:
+    - grafana.company.com
+
+alertmanager:
+  alertmanagerSpec:
+    storage:
+      volumeClaimTemplate:
+        spec:
+          resources:
+            requests:
+              storage: 10Gi
+
+nodeExporter:
+  enabled: true
+
+kubeStateMetrics:
+  enabled: true
+EOF
+
+helm upgrade --install kube-prom-stack \
+  prometheus-community/kube-prometheus-stack \
+  --namespace monitoring \
+  --create-namespace \
+  -f prometheus-values.yaml
+
+# Access
+kubectl port-forward svc/kube-prom-stack-grafana 3000:80 -n monitoring
+# http://localhost:3000 (admin/MySecureGrafanaPass)
+
+kubectl port-forward svc/kube-prom-stack-kube-prom-prometheus 9090 -n monitoring
+# http://localhost:9090
+
+kubectl port-forward svc/kube-prom-stack-kube-prom-alertmanager 9093 -n monitoring
+# http://localhost:9093
+```
+
+### Custom Application Metrics
+```yaml
+# ============================================
+# SERVICEMONITOR — Custom app metrics scrape
+# ============================================
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: myapp-monitor
+  namespace: monitoring
+  labels:
+    release: kube-prom-stack          # Helm release name match karo
+spec:
+  namespaceSelector:
+    matchNames:
+    - production
+  selector:
+    matchLabels:
+      app: myapp
+  endpoints:
+  - port: http                        # Service port naam
+    path: /metrics
+    interval: 15s
+    scrapeTimeout: 10s
+
+---
+# ============================================
+# PROMETHEUSRULE — Alerting Rules
+# ============================================
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: myapp-alerts
+  namespace: monitoring
+  labels:
+    release: kube-prom-stack
+spec:
+  groups:
+  - name: myapp.availability
+    interval: 30s
+    rules:
+    # Pod down alert
+    - alert: PodDown
+      expr: |
+        kube_pod_status_ready{condition="true",namespace="production"} == 0
+      for: 5m
+      labels:
+        severity: critical
+        team: backend
+      annotations:
+        summary: "Pod {{ $labels.pod }} is not ready"
+        description: "Pod has been not ready for more than 5 minutes"
+        runbook: "https://wiki.company.com/runbooks/pod-down"
+
+    # High error rate
+    - alert: HighErrorRate
+      expr: |
+        rate(http_requests_total{status=~"5..",job="myapp"}[5m]) /
+        rate(http_requests_total{job="myapp"}[5m]) > 0.05
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "High 5xx error rate: {{ humanizePercentage $value }}"
+
+    # High memory usage
+    - alert: HighMemoryUsage
+      expr: |
+        container_memory_working_set_bytes{namespace="production",container!=""}
+        / container_spec_memory_limit_bytes{namespace="production",container!=""} > 0.9
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: "{{ $labels.pod }}/{{ $labels.container }} memory > 90%"
+
+    # Pod CrashLoopBackOff
+    - alert: PodCrashLooping
+      expr: |
+        rate(kube_pod_container_status_restarts_total[15m]) * 60 * 15 > 0
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Pod {{ $labels.pod }} is crash looping"
+
+  - name: myapp.performance
+    rules:
+    # High P99 latency
+    - alert: HighLatency
+      expr: |
+        histogram_quantile(0.99,
+          rate(http_request_duration_seconds_bucket{job="myapp"}[5m])
+        ) > 2
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: "P99 latency > 2s: {{ $value | humanizeDuration }}"
+```
+
+```bash
+# ============================================
+# USEFUL PROMQL QUERIES
+# ============================================
+
+# CPU usage per pod (percentage)
+sum(rate(container_cpu_usage_seconds_total{
+  namespace="production", container!=""}[5m])) by (pod)
+/ sum(kube_pod_container_resource_limits{
+  namespace="production", resource="cpu"}) by (pod) * 100
+
+# Memory usage per pod
+sum(container_memory_working_set_bytes{
+  namespace="production", container!=""}) by (pod)
+
+# Pod restart count (last hour)
+increase(kube_pod_container_status_restarts_total{
+  namespace="production"}[1h])
+
+# HTTP request rate
+rate(http_requests_total{job="myapp"}[5m])
+
+# Error rate percentage
+rate(http_requests_total{status=~"5..",job="myapp"}[5m]) /
+rate(http_requests_total{job="myapp"}[5m]) * 100
+
+# P95 Latency
+histogram_quantile(0.95,
+  rate(http_request_duration_seconds_bucket{job="myapp"}[5m]))
+
+# Node CPU utilization
+100 - (avg by (instance)(
+  rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+
+# Node memory available
+node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes * 100
+
+# Pending pods
+kube_pod_status_phase{phase="Pending"} == 1
+
+# PVC usage
+kubelet_volume_stats_used_bytes / kubelet_volume_stats_capacity_bytes * 100
+```
+
+---
+
+## Chapter 32: Logging — EFK Stack
+
+> 🔗 Related: [DaemonSets](#chapter-20-daemonsets) | [ConfigMaps & Secrets](#chapter-13-configmaps--secrets)
+
+### 🇮🇳 Hindi Explanation
+**EFK = Elasticsearch + Fluent Bit + Kibana**
+**Flow:** `Container logs → Fluent Bit (DaemonSet) → Elasticsearch → Kibana`
+
+**Alternative:** Loki + Grafana (lightweight, cost-effective)
+
+```bash
+# ============================================
+# HELM SE EFK INSTALL
+# ============================================
+helm repo add elastic https://helm.elastic.co
+helm repo add fluent https://fluent.github.io/helm-charts
+helm repo update
+
+# Elasticsearch
+helm install elasticsearch elastic/elasticsearch \
+  --namespace logging \
+  --create-namespace \
+  --set replicas=1 \
+  --set minimumMasterNodes=1 \
+  --set resources.requests.cpu=100m \
+  --set resources.requests.memory=512Mi \
+  --set resources.limits.cpu=1000m \
+  --set resources.limits.memory=2Gi \
+  --set volumeClaimTemplate.resources.requests.storage=30Gi \
+  --set esJavaOpts="-Xmx512m -Xms512m"
+
+# Kibana
+helm install kibana elastic/kibana \
+  --namespace logging \
+  --set service.type=ClusterIP \
+  --set resources.requests.cpu=100m \
+  --set resources.requests.memory=256Mi
+
+# Fluent Bit (Log collector — DaemonSet)
+helm install fluent-bit fluent/fluent-bit \
+  --namespace logging \
+  -f fluent-bit-values.yaml
+
+# Access
+kubectl port-forward svc/kibana-kibana 5601:5601 -n logging
+# http://localhost:5601
+```
+
+```yaml
+# fluent-bit-values.yaml
+config:
+  service: |
+    [SERVICE]
+        Daemon Off
+        Flush 1
+        Log_Level info
+        Parsers_File parsers.conf
+        HTTP_Server On
+        HTTP_Listen 0.0.0.0
+        HTTP_Port 2020
+        Health_Check On
+
+  inputs: |
+    [INPUT]
+        Name tail
+        Path /var/log/containers/*.log
+        multiline.parser docker, cri
+        Tag kube.*
+        Mem_Buf_Limit 50MB
+        Skip_Long_Lines On
+        Refresh_Interval 10
+
+  filters: |
+    [FILTER]
+        Name kubernetes
+        Match kube.*
+        Merge_Log On
+        Keep_Log Off
+        K8S-Logging.Parser On
+        K8S-Logging.Exclude Off
+        Annotations Off
+        Labels On
+
+    [FILTER]
+        Name grep
+        Match kube.*
+        Exclude log ^$
+
+  outputs: |
+    [OUTPUT]
+        Name es
+        Match kube.*
+        Host elasticsearch-master.logging
+        Port 9200
+        Logstash_Format On
+        Logstash_Prefix kubernetes
+        Retry_Limit False
+        tls Off
+        tls.verify Off
+
+tolerations:
+- operator: Exists                   # Sab nodes pe chale
+resources:
+  limits:
+    memory: 128Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+```
+
+### Loki + Grafana (Modern Alternative)
+```bash
+# ============================================
+# LOKI STACK (Lightweight alternative)
+# ============================================
+helm repo add grafana https://grafana.github.io/helm-charts
+
+helm install loki grafana/loki-stack \
+  --namespace logging \
+  --create-namespace \
+  --set grafana.enabled=true \
+  --set grafana.adminPassword=admin123 \
+  --set loki.persistence.enabled=true \
+  --set loki.persistence.size=10Gi
+
+# Grafana mein Loki datasource automatically add hota hai
+kubectl port-forward svc/loki-grafana 3000:80 -n logging
+# Explore → Loki → Log browser
+```
+
+---
+
+## Chapter 33: Kubernetes Dashboard
+
+> 🔗 Related: [RBAC](#chapter-22-rbac) | [Service Accounts](#chapter-23-service-accounts)
+
+### 🇮🇳 Hindi Explanation
+**Kubernetes Dashboard** ek web UI hai cluster manage karne ke liye. Production mein RBAC ke saath secure karo.
+
+```bash
+# ============================================
+# DASHBOARD INSTALL
+# ============================================
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/dashboard/v3.0.0/aio/deploy/recommended.yaml
+
+# Verify
+kubectl get pods -n kubernetes-dashboard
+
+# ============================================
+# ACCESS SETUP
+# ============================================
+# Admin Service Account banao
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: admin-user
+  namespace: kubernetes-dashboard
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: admin-user
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: admin-user
+  namespace: kubernetes-dashboard
+EOF
+
+# Token generate karo
+kubectl create token admin-user -n kubernetes-dashboard
+# Token copy karo
+
+# Proxy start karo
+kubectl proxy
+# http://localhost:8001/api/v1/namespaces/kubernetes-dashboard/services/https:kubernetes-dashboard:/proxy/
+
+# ============================================
+# MINIKUBE DASHBOARD
+# ============================================
+minikube dashboard                    # Auto browser open
+
+# ============================================
+# PRODUCTION: INGRESS SE EXPOSE KARO
+# ============================================
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: dashboard-ingress
+  namespace: kubernetes-dashboard
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    nginx.ingress.kubernetes.io/ssl-passthrough: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: dashboard.company.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: kubernetes-dashboard
+            port:
+              number: 443
+```
+
+---
+
+## Chapter 34: Cluster Upgrades & Maintenance
+
+> 🔗 Related: [etcd Backup](#chapter-35-etcd-backup--restore) | [PDB](#chapter-28-pod-disruption-budget-pdb)
+
+### 🇮🇳 Hindi Explanation
+**Zero-downtime cluster upgrade** ke liye:
+1. etcd backup lo (ZAROORI!)
+2. Control plane upgrade karo
+3. Worker nodes ek ek karke upgrade karo (drain → upgrade → uncordon)
+
+**Rule:** Ek time pe sirf **1 minor version** upgrade karo (1.27 → 1.28, never 1.27 → 1.29)
+
+```bash
+# ============================================
+# PRE-UPGRADE CHECKLIST
+# ============================================
+kubectl version                        # Current version
+kubeadm version
+kubectl get nodes                      # All nodes Ready hain?
+kubectl get pods -A | grep -v Running | grep -v Completed  # Failed pods?
+# etcd backup lo (Chapter 35 dekho)
+# Release notes padho!
+
+# ============================================
+# STEP 1: CONTROL PLANE UPGRADE
+# ============================================
+
+# Available versions check karo
+apt-cache madison kubeadm | head -5
+
+# kubeadm upgrade karo
+apt-mark unhold kubeadm
+apt-get update
+apt-get install -y kubeadm=1.29.0-00
+apt-mark hold kubeadm
+kubeadm version                        # Verify
+
+# Upgrade plan dekho
+kubeadm upgrade plan
+# Shows: current version, available versions, components
+
+# Upgrade apply karo
+sudo kubeadm upgrade apply v1.29.0
+# Type 'y' when prompted
+
+# kubelet aur kubectl upgrade karo
+apt-mark unhold kubelet kubectl
+apt-get install -y kubelet=1.29.0-00 kubectl=1.29.0-00
+apt-mark hold kubelet kubectl
+systemctl daemon-reload
+systemctl restart kubelet
+
+# Verify
+kubectl get nodes                      # Master node version updated?
+
+# ============================================
+# STEP 2: WORKER NODES UPGRADE (One by one)
+# ============================================
+
+# Worker-1 upgrade karo
+
+# Master node se: Worker drain karo
+kubectl drain worker-1 \
+  --ignore-daemonsets \
+  --delete-emptydir-data \
+  --grace-period=60 \
+  --timeout=5m
+# Pods dusre nodes pe move ho jaate hain
+
+# Worker-1 pe SSH karo
+ssh worker-1
+
+# kubeadm upgrade
+apt-mark unhold kubeadm
+apt-get update && apt-get install -y kubeadm=1.29.0-00
+apt-mark hold kubeadm
+sudo kubeadm upgrade node              # Control plane se alag command!
+
+# kubelet + kubectl upgrade
+apt-mark unhold kubelet kubectl
+apt-get install -y kubelet=1.29.0-00 kubectl=1.29.0-00
+apt-mark hold kubelet kubectl
+systemctl daemon-reload
+systemctl restart kubelet
+
+# Master node se: Worker wapas active karo
+kubectl uncordon worker-1
+kubectl get nodes                      # worker-1 Ready + new version?
+
+# Verify pods schedule ho rahe hain
+kubectl get pods -A -o wide | grep worker-1
+
+# Same process: worker-2, worker-3, ...
+
+# ============================================
+# NODE MAINTENANCE
+# ============================================
+
+# Maintenance ke liye drain karo
+kubectl drain worker-2 \
+  --ignore-daemonsets \
+  --delete-emptydir-data \
+  --grace-period=30
+# Maintenance karo...
+kubectl uncordon worker-2
+
+# Sirf scheduling rok do (pods nahi jaate)
+kubectl cordon worker-3
+kubectl get nodes                      # worker-3: Ready,SchedulingDisabled
+kubectl uncordon worker-3
+
+# Node labels update karo
+kubectl label node worker-1 maintenance-window="sunday-3am"
+```
+
+---
+
+## Chapter 35: etcd Backup & Restore
+
+> 🔗 Related: [Kubernetes Architecture](#chapter-2-kubernetes-architecture) | [Cluster Upgrades](#chapter-34-cluster-upgrades--maintenance)
+
+### 🇮🇳 Hindi Explanation
+**etcd** mein poora cluster ka state hai — agar ye corrupt ho jaaye ya delete ho jaaye toh poora cluster data chala jaata hai. **Regular backup ZAROORI hai!**
+
+```bash
+# ============================================
+# ETCD BACKUP
+# ============================================
+
+# etcd endpoint aur certificates dhundho
+kubectl get pods -n kube-system | grep etcd
+kubectl describe pod etcd-master -n kube-system | grep -E "(command|--listen|--cert|--key|--trusted)"
+
+# Ya static pod manifest dekho
+cat /etc/kubernetes/manifests/etcd.yaml | grep -E "(cert|key|endpoints)"
+
+# Backup karo
+ETCDCTL_API=3 etcdctl snapshot save /backup/etcd-$(date +%Y%m%d_%H%M%S).db \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt \
+  --key=/etc/kubernetes/pki/etcd/healthcheck-client.key
+
+# Backup verify karo
+ETCDCTL_API=3 etcdctl snapshot status /backup/etcd-20240115_020000.db \
+  --write-out=table
+# Shows: Hash, Revision, Total Keys, Total Size
+
+# Backup file check karo
+ls -lh /backup/
+
+# ============================================
+# AUTOMATED BACKUP (CronJob)
+# ============================================
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: etcd-backup
+  namespace: kube-system
+spec:
+  schedule: "0 */6 * * *"           # Har 6 ghante
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          hostNetwork: true
+          containers:
+          - name: etcd-backup
+            image: k8s.gcr.io/etcd:3.5.9-0
+            command:
+            - /bin/sh
+            - -c
+            - |
+              ETCDCTL_API=3 etcdctl snapshot save \
+                /backup/etcd-$(date +%Y%m%d_%H%M%S).db \
+                --endpoints=https://127.0.0.1:2379 \
+                --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+                --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt \
+                --key=/etc/kubernetes/pki/etcd/healthcheck-client.key
+              # Old backups clean karo (7 din se purani)
+              find /backup -name "*.db" -mtime +7 -delete
+            volumeMounts:
+            - name: etcd-certs
+              mountPath: /etc/kubernetes/pki/etcd
+              readOnly: true
+            - name: backup-storage
+              mountPath: /backup
+          restartPolicy: OnFailure
+          nodeSelector:
+            node-role.kubernetes.io/control-plane: ""
+          tolerations:
+          - key: node-role.kubernetes.io/control-plane
+            effect: NoSchedule
+          volumes:
+          - name: etcd-certs
+            hostPath:
+              path: /etc/kubernetes/pki/etcd
+          - name: backup-storage
+            hostPath:
+              path: /var/backups/etcd
+
+# ============================================
+# ETCD RESTORE (Emergency!)
+# ============================================
+
+# Step 1: API server stop karo (static pod manifest move karo)
+mv /etc/kubernetes/manifests/kube-apiserver.yaml /tmp/
+# API server automatically stop hoga
+sleep 30
+
+# Step 2: etcd stop karo
+mv /etc/kubernetes/manifests/etcd.yaml /tmp/
+sleep 10
+
+# Step 3: Old data backup karo (safety ke liye)
+mv /var/lib/etcd /var/lib/etcd.old.$(date +%Y%m%d)
+
+# Step 4: Snapshot restore karo
+ETCDCTL_API=3 etcdctl snapshot restore /backup/etcd-20240115_020000.db \
+  --data-dir=/var/lib/etcd \
+  --initial-cluster="master=https://192.168.1.10:2380" \
+  --initial-cluster-token="etcd-cluster-1" \
+  --initial-advertise-peer-urls="https://192.168.1.10:2380" \
+  --name="master"
+
+# Step 5: Ownership fix karo
+chown -R etcd:etcd /var/lib/etcd
+
+# Step 6: etcd wapas start karo
+mv /tmp/etcd.yaml /etc/kubernetes/manifests/
+sleep 30
+kubectl get pods -n kube-system | grep etcd
+
+# Step 7: API server wapas start karo
+mv /tmp/kube-apiserver.yaml /etc/kubernetes/manifests/
+sleep 30
+kubectl get nodes
+kubectl get pods -A
+```
+
+### 🎯 Interview Answer
+**Q: How do you backup and restore etcd in Kubernetes?**
+
+etcd is the single source of truth for cluster state. **Backup**: Use `etcdctl snapshot save` with etcd certificates (ca.crt, client cert/key). Automate with CronJob every few hours, store backups externally (S3, GCS). Always verify with `etcdctl snapshot status`. **Restore**: Stop API server (move static pod manifest), stop etcd, backup existing data dir, run `etcdctl snapshot restore` to new data dir, restart etcd then API server. In managed clusters (EKS, GKE, AKS), the cloud provider manages etcd backup automatically. Key: test your restore procedure regularly — don't discover it's broken during an outage!
+
+---
+
+## Chapter 36: CRDs & Operators
+
+> 🔗 Related: [Kubernetes Architecture](#chapter-2-kubernetes-architecture) | [RBAC](#chapter-22-rbac)
+
+### 🇮🇳 Hindi Explanation
+**CRD (Custom Resource Definition)** — K8s mein apna custom resource type define karo. Jaise `Pod`, `Deployment` built-in resources hain, waise tum `Database`, `KafkaCluster`, `RedisInstance` jaise custom resources bana sakte ho.
+
+**Operator** = CRD + Controller. Complex stateful applications ko K8s-native way se manage karo.
+
+**Popular Operators:**
+- PostgreSQL Operator (Zalando, CloudNativePG)
+- Kafka Operator (Strimzi)
+- Elasticsearch Operator
+- Redis Operator
+- Prometheus Operator
+
+```yaml
+# ============================================
+# CRD DEFINITION
+# ============================================
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: databases.mycompany.io       # plural.group format
+
+spec:
+  group: mycompany.io
+  scope: Namespaced                  # Namespaced | Cluster
+
+  names:
+    plural: databases
+    singular: database
+    kind: Database
+    shortNames: ["db"]
+    categories: ["all"]              # kubectl get all mein dikhe
+
+  versions:
+  - name: v1
+    served: true
+    storage: true                    # Storage version (ek hi ho)
+    deprecated: false
+
+    # Schema validation
+    schema:
+      openAPIV3Schema:
+        type: object
+        required: ["spec"]
+        properties:
+          spec:
+            type: object
+            required: ["engine", "version"]
+            properties:
+              engine:
+                type: string
+                enum: ["postgresql", "mysql", "mongodb"]
+                description: "Database engine type"
+              version:
+                type: string
+                description: "Database version"
+              replicas:
+                type: integer
+                minimum: 1
+                maximum: 10
+                default: 1
+              storage:
+                type: object
+                properties:
+                  size:
+                    type: string
+                    pattern: '^[0-9]+Gi$'
+                    default: "10Gi"
+                  storageClass:
+                    type: string
+              resources:
+                type: object
+                properties:
+                  cpu:
+                    type: string
+                    default: "500m"
+                  memory:
+                    type: string
+                    default: "1Gi"
+              backup:
+                type: object
+                properties:
+                  enabled:
+                    type: boolean
+                    default: false
+                  schedule:
+                    type: string
+          status:
+            type: object
+            properties:
+              phase:
+                type: string
+                enum: ["Pending", "Running", "Degraded", "Failed"]
+              replicas:
+                type: integer
+              readyReplicas:
+                type: integer
+              connectionString:
+                type: string
+              conditions:
+                type: array
+                items:
+                  type: object
+
+    # kubectl get databases mein columns
+    additionalPrinterColumns:
+    - name: Engine
+      type: string
+      jsonPath: .spec.engine
+    - name: Version
+      type: string
+      jsonPath: .spec.version
+    - name: Replicas
+      type: integer
+      jsonPath: .spec.replicas
+    - name: Phase
+      type: string
+      jsonPath: .status.phase
+    - name: Age
+      type: date
+      jsonPath: .metadata.creationTimestamp
+
+    # Subresources
+    subresources:
+      status: {}                     # /status endpoint
+      scale:                         # kubectl scale support
+        specReplicasPath: .spec.replicas
+        statusReplicasPath: .status.replicas
+
+---
+# ============================================
+# CUSTOM RESOURCE INSTANCE
+# ============================================
+apiVersion: mycompany.io/v1
+kind: Database
+metadata:
+  name: production-postgres
+  namespace: production
+spec:
+  engine: postgresql
+  version: "15.4"
+  replicas: 3
+  storage:
+    size: "50Gi"
+    storageClass: fast-ssd
+  resources:
+    cpu: "1000m"
+    memory: "2Gi"
+  backup:
+    enabled: true
+    schedule: "0 2 * * *"
+```
+
+```bash
+# CRD commands
+kubectl get crd
+kubectl describe crd databases.mycompany.io
+kubectl get databases -n production   # Custom resources
+kubectl get db -n production          # Short name
+kubectl describe db production-postgres -n production
+kubectl get all                       # 'all' category mein dikhega
+kubectl scale db production-postgres --replicas=5  # Subresource se
+
+# Operator install karo (example: CloudNativePG)
+helm repo add cnpg https://cloudnative-pg.github.io/charts
+helm install cnpg cnpg/cloudnative-pg \
+  --namespace cnpg-system \
+  --create-namespace
+
+# CloudNativePG Cluster use karo
+cat <<EOF | kubectl apply -f -
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: production-db
+spec:
+  instances: 3
+  storage:
+    size: 50Gi
+  postgresql:
+    parameters:
+      max_connections: "200"
+  backup:
+    barmanObjectStore:
+      destinationPath: s3://my-backup-bucket/
+      s3Credentials:
+        accessKeyId:
+          name: s3-creds
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: s3-creds
+          key: ACCESS_SECRET_KEY
+EOF
+```
+
+---
+
+## Chapter 37: Pod Security (PSA)
+
+> 🔗 Related: [Pods](#chapter-5-pods--complete) | [Namespaces](#chapter-8-namespaces)
+
+### 🇮🇳 Hindi Explanation
+**Pod Security Admission (PSA)** — K8s 1.25 mein stable hua. Pods ke security standards enforce karo namespace level pe.
+
+**3 Security Levels:**
+- `privileged` — Koi restriction nahi (system/infra pods ke liye)
+- `baseline` — Minimal restrictions (common privilege escalation rokta hai)
+- `restricted` — Strict security (best practices enforce karta hai)
+
+**3 Modes:**
+- `enforce` — Violating pods reject karo
+- `audit` — Log karo lekin allow karo
+- `warn` — Warning show karo lekin allow karo
+
+```yaml
+# ============================================
+# NAMESPACE MEIN PSA LABELS
+# ============================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  labels:
+    # Strict security enforce karo
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+
+    # Audit bhi karo (logs mein jayega)
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+
+    # Warning bhi dikhao
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+
+---
+# System namespace — privileged allow karo
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    pod-security.kubernetes.io/enforce: privileged
+
+---
+# ============================================
+# RESTRICTED LEVEL KE LIYE POD REQUIREMENTS
+# ============================================
+spec:
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    seccompProfile:
+      type: RuntimeDefault            # RuntimeDefault | Localhost
+
+  containers:
+  - name: app
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop: ["ALL"]
+      # runAsNonRoot: true            # Pod level pe set hai
+      # seccompProfile set hai pod level pe
+```
+
+```bash
+# PSA test karo
+kubectl label namespace production \
+  pod-security.kubernetes.io/enforce=restricted
+
+# Violation check karo
+kubectl run privileged-pod --image=nginx \
+  --overrides='{"spec":{"securityContext":{"runAsUser":0}}}' \
+  -n production
+# Error: violates PodSecurity "restricted:latest"
+
+# Dry run (namespace label add kiye bina test)
+kubectl label namespace production \
+  pod-security.kubernetes.io/warn=restricted \
+  --dry-run=server
+```
+
+---
+
+## Chapter 38: Admission Controllers
+
+> 🔗 Related: [CRDs & Operators](#chapter-36-crds--operators) | [Pod Security](#chapter-37-pod-security-psa)
+
+### 🇮🇳 Hindi Explanation
+**Admission Controllers** K8s API requests ko process karte hain — resource create/update hone se pehle validate ya modify kar sakte hain.
+
+**2 Types:**
+- **Validating** — Request accept ya reject karo (modify nahi karte)
+- **Mutating** — Request modify karo (defaults inject karo, labels add karo)
+
+**Built-in Popular Controllers:**
+- `NamespaceLifecycle` — Deleted namespace mein objects nahi banne deta
+- `LimitRanger` — Resource defaults apply karta hai
+- `ResourceQuota` — Quota enforce karta hai
+- `PodSecurity` — PSA enforce karta hai
+- `MutatingAdmissionWebhook` — Custom webhooks
+- `ValidatingAdmissionWebhook` — Custom webhooks
+
+```yaml
+# ============================================
+# VALIDATING WEBHOOK EXAMPLE
+# ============================================
+# (Requires a webhook server running)
+
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: myapp-validator
+webhooks:
+- name: validate.myapp.io
+  rules:
+  - apiGroups: ["apps"]
+    apiVersions: ["v1"]
+    operations: ["CREATE", "UPDATE"]
+    resources: ["deployments"]
+    scope: "Namespaced"
+
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: webhook-system
+      path: "/validate-apps-v1-deployment"
+    caBundle: <base64-encoded-ca>
+
+  admissionReviewVersions: ["v1"]
+  sideEffects: None
+  failurePolicy: Fail                # Fail | Ignore
+  namespaceSelector:
+    matchLabels:
+      validate: "true"
+
+---
+# ============================================
+# MUTATING WEBHOOK EXAMPLE
+# ============================================
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: myapp-mutator
+webhooks:
+- name: mutate.myapp.io
+  rules:
+  - apiGroups: [""]
+    apiVersions: ["v1"]
+    operations: ["CREATE"]
+    resources: ["pods"]
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: webhook-system
+      path: "/mutate-v1-pod"
+    caBundle: <base64-encoded-ca>
+  admissionReviewVersions: ["v1"]
+  sideEffects: None
+  # Sidecar inject karne ke liye
+  # (Istio, Vault agent, etc. yahi use karte hain)
+```
+
+```bash
+# Active admission controllers dekho
+kubectl get validatingwebhookconfigurations
+kubectl get mutatingwebhookconfigurations
+kubectl describe validatingwebhookconfiguration myapp-validator
+```
+
+---
+
+## Chapter 39: Production Checklist
+
+> 🔗 Related: [Resource Requests](#chapter-16-resource-requests--limits) | [PDB](#chapter-28-pod-disruption-budget-pdb) | [Network Policies](#chapter-24-network-policies)
+
+```yaml
+# ============================================
+# PRODUCTION-READY DEPLOYMENT TEMPLATE
+# ============================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-service
+  namespace: production
+  annotations:
+    kubernetes.io/change-cause: "v2.1.0 — performance improvements"
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0              # ✅ Zero downtime
+  selector:
+    matchLabels:
+      app: api-service
+  template:
+    metadata:
+      labels:
+        app: api-service
+        version: "v2.1.0"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+    spec:
+      serviceAccountName: api-service-sa    # ✅ Dedicated SA
+      automountServiceAccountToken: false    # ✅ Token sirf zaroori ho tab
+
+      # ✅ Security Context
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 2000
+        seccompProfile:
+          type: RuntimeDefault
+
+      # ✅ Topology spread (HA)
+      topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app: api-service
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector:
+          matchLabels:
+            app: api-service
+
+      containers:
+      - name: api
+        image: myrepo/api-service:v2.1.0    # ✅ Pinned version (not latest)
+        imagePullPolicy: Always
+
+        # ✅ Container security
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+
+        # ✅ Resource limits set hain
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+
+        ports:
+        - containerPort: 8080
+          name: http
+        - containerPort: 9090
+          name: metrics
+
+        # ✅ ConfigMap & Secret se config
+        envFrom:
+        - configMapRef:
+            name: api-config
+        - secretRef:
+            name: api-secrets
+
+        # ✅ Sab 3 probes set hain
+        livenessProbe:
+          httpGet:
+            path: /health/live
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 20
+          failureThreshold: 3
+          timeoutSeconds: 5
+
+        readinessProbe:
+          httpGet:
+            path: /health/ready
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          failureThreshold: 3
+          successThreshold: 1
+
+        startupProbe:
+          httpGet:
+            path: /health/started
+            port: 8080
+          failureThreshold: 30
+          periodSeconds: 10
+
+        # ✅ Graceful shutdown
+        lifecycle:
+          preStop:
+            exec:
+              command: ["/bin/sh", "-c", "sleep 20"]
+
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: app-config
+          mountPath: /app/config
+          readOnly: true
+
+      # ✅ Graceful termination
+      terminationGracePeriodSeconds: 60
+
+      volumes:
+      - name: tmp
+        emptyDir:
+          sizeLimit: 100Mi
+      - name: app-config
+        configMap:
+          name: api-config
+
+      imagePullSecrets:
+      - name: registry-credentials
+
+---
+# ✅ Pod Disruption Budget
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api-service-pdb
+  namespace: production
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: api-service
+
+---
+# ✅ HPA
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-service-hpa
+  namespace: production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-service
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+```
+
+### Production Checklist Table
+```
+✅ WORKLOAD
+  □ Resource requests AND limits set hain
+  □ Liveness + Readiness + Startup probes configured
+  □ Pinned image tags (not :latest)
+  □ Non-root user
+  □ ReadOnlyRootFilesystem: true
+  □ capabilities: drop ALL
+  □ allowPrivilegeEscalation: false
+  □ preStop hook (graceful drain)
+  □ terminationGracePeriodSeconds set
+  □ topologySpreadConstraints (HA)
+  □ PodDisruptionBudget configured
+
+✅ SCALING
+  □ HPA configured (minReplicas >= 2 for production)
+  □ Resource requests set (HPA ke liye zaroori)
+  □ VPA recommendations review kiye
+
+✅ NETWORKING
+  □ NetworkPolicy: default-deny + explicit allows
+  □ Service type appropriate (ClusterIP for internal)
+  □ Ingress TLS configured
+  □ DNS working (nslookup test karo)
+
+✅ STORAGE
+  □ StorageClass configured
+  □ PVC backup strategy
+  □ StatefulSet volumeClaimTemplates
+
+✅ CONFIGURATION
+  □ ConfigMaps for non-sensitive config
+  □ Secrets for sensitive data
+  □ External secret management (Vault/ESO)
+  □ No hardcoded credentials in images
+
+✅ OBSERVABILITY
+  □ Prometheus metrics exposed (/metrics)
+  □ ServiceMonitor configured
+  □ PrometheusRule alerts configured
+  □ Logs structured (JSON format)
+  □ Fluent Bit DaemonSet running
+  □ Distributed tracing configured
+
+✅ SECURITY
+  □ RBAC: Least privilege principle
+  □ Dedicated ServiceAccount per app
+  □ automountServiceAccountToken: false (when not needed)
+  □ NetworkPolicy micro-segmentation
+  □ Image vulnerability scanning in CI/CD
+  □ Pod Security Standards (namespace labels)
+
+✅ RELIABILITY
+  □ etcd backup automated (CronJob)
+  □ Cluster upgrade process tested
+  □ Disaster recovery runbook written
+  □ Load testing done
+  □ Chaos engineering (optional)
+```
+
+---
+
+## Chapter 40: Kubernetes Interview Q&A
+
+> 🔗 Related: All chapters
+
+### Top Interview Questions
+
+---
+
+**Q1: What happens when you run `kubectl apply -f deployment.yaml`?**
+
+> 1. **kubectl** YAML parse karta hai aur API server ko REST request bhejta hai
+> 2. **kube-apiserver** authentication (who are you?) aur authorization (can you do this?) karta hai
+> 3. **Admission Controllers** request validate/mutate karte hain (LimitRanger defaults, PSA checks)
+> 4. Object **etcd** mein persist hota hai (desired state store)
+> 5. **Deployment Controller** (controller-manager mein) change detect karta hai → **ReplicaSet** create karta hai
+> 6. **ReplicaSet Controller** required Pods create karta hai
+> 7. **kube-scheduler** har Pod ke liye suitable node find karta hai (resources, affinity, taints dekh ke) → Pod ko node assign karta hai
+> 8. **kubelet** (assigned node pe) PodSpec dekh ke **containerd** se container create karwata hai
+> 9. **kube-proxy** Service ke liye iptables rules update karta hai
+> 10. Container running → readinessProbe pass → Service endpoints mein add
+
+---
+
+**Q2: Liveness vs Readiness vs Startup Probe?**
+
+| Probe | Purpose | Failure Action | Use Case |
+|-------|---------|----------------|----------|
+| **Liveness** | Container alive hai? | Container restart | Deadlock detection |
+| **Readiness** | Traffic ready? | Service se remove | Startup warmup, DB connections |
+| **Startup** | Slow start? | Blocks liveness/readiness | Legacy apps, slow JVM startup |
+
+---
+
+**Q3: Why use Deployment over bare Pods?**
+
+> Bare Pods self-heal nahi karte — node die ho toh pod gone. Deployment ek **ReplicaSet** manage karta hai jo desired replica count maintain karta hai. Extra features: rolling updates (zero downtime), rollback (previous RS se), scaling, pause/resume updates.
+
+---
+
+**Q4: What is etcd and why is it critical?**
+
+> etcd ek **distributed, consistent key-value store** hai jo K8s ka **single source of truth** hai — har object (pods, services, secrets, configs) yahan stored hai. kube-apiserver iske saath directly baat karta hai. If etcd goes down → cluster state lost → existing workloads run karte rahte hain lekin koi naya operation nahi ho sakta. **Raft consensus algorithm** use karta hai consistency ke liye. Production mein 3 ya 5 etcd nodes (odd number) HA ke liye.
+
+---
+
+**Q5: How does K8s achieve zero-downtime deployments?**
+
+> Rolling Update strategy ke saath: `maxUnavailable: 0` + `maxSurge: 1` set karo. K8s ek naya pod start karta hai → readinessProbe pass hone ka wait karta hai → ek purana pod terminate karta hai → repeat. Readiness probe ensure karta hai ki naya pod traffic serve karne ready hai before old pod remove hota hai. preStop hook + terminationGracePeriodSeconds graceful shutdown ensure karta hai.
+
+---
+
+**Q6: Deployment vs StatefulSet vs DaemonSet?**
+
+| Object | Use Case | Pod Identity | Storage |
+|--------|---------|-------------|---------|
+| **Deployment** | Stateless apps (API, Web) | Random | Shared |
+| **StatefulSet** | Stateful apps (DB, Kafka) | Stable (pod-0, pod-1) | Per-pod PVC |
+| **DaemonSet** | Node-level agents | One per node | HostPath |
+
+---
+
+**Q7: How does Service Discovery work in K8s?**
+
+> **CoreDNS** (kube-system namespace) automatically DNS records create karta hai. Service create hone pe: `<service>.<namespace>.svc.cluster.local` A record ban jaata hai. Pod ka `/etc/resolv.conf` CoreDNS ClusterIP + search domains point karta hai. Short name (`my-svc`) work karta hai same namespace mein, cross-namespace ke liye `my-svc.other-ns` use karo.
+
+---
+
+**Q8: What is the difference between ConfigMap and Secret?**
+
+> **ConfigMap** non-sensitive config (plain text in etcd). **Secret** sensitive data (base64-encoded, NOT encrypted by default). Production mein: etcd encryption at rest enable karo, RBAC se Secret access restrict karo, External Secrets Operator (ESO) se AWS Secrets Manager/Vault se fetch karo. Secret ko volume mount se use karo (automatic rotation support), env var se better.
+
+---
+
+**Q9: How does HPA work?**
+
+> HPA Metrics Server se metrics query karta hai har 15 seconds. Formula: `desiredReplicas = ceil(currentReplicas * currentMetric/desiredMetric)`. Example: 3 pods, 90% CPU, target 70% → `ceil(3 * 90/70)` = 4 pods. Scale-down mein 5 min stabilization window hai (flapping prevent karne ke liye). Requirements: pods mein resource requests set hone chahiye.
+
+---
+
+**Q10: What is RBAC and what are its components?**
+
+> RBAC (Role-Based Access Control): **Role** (namespace permissions), **ClusterRole** (cluster-wide), **RoleBinding** (Role + subjects in namespace), **ClusterRoleBinding** (ClusterRole + subjects globally). Subjects: User, Group, ServiceAccount. Principle: least privilege — sirf zaroori permissions do. Common pattern: Deployment SA ko sirf apne namespace mein pods/configmaps read karne do.
+
+---
+
+**Q11: What is a Service Mesh and when to use it?**
+
+> Service Mesh (Istio, Linkerd) infrastructure layer hai service-to-service communication ke liye. Sidecar proxy (Envoy) har pod mein inject hota hai. Provides: **mTLS** (automatic encryption + auth), **traffic management** (canary, circuit breaking, retries), **observability** (distributed tracing, metrics), **L7 load balancing**. Use karo jab: 10+ microservices, zero-trust security required, canary deployments chahiye, distributed tracing needed. Overhead: complexity aur latency badh jaati hai.
+
+---
+
+**Q12: Node fails — what happens to pods?**
+
+> 1. **Node Controller** node ke `node.kubernetes.io/not-ready` taint lagate hai (40 seconds ke baad node unreachable pe)
+> 2. `tolerationSeconds` (default 300 seconds = 5 min) ke baad pods evict hone lagte hain
+> 3. **Deployment/ReplicaSet Controller** missing pods detect karta hai → naye pods schedule karta hai dusre nodes pe
+> 4. **StatefulSet** pods same naam se reschedule hote hain
+> 5. **PDB** ensure karta hai ki minimum available pods maintain ho during eviction
+> 6. Node wapas aane pe: existing pods chal rahe hain, kube-proxy rules update hote hain
+
+---
+
+## Chapter 41: Quick Reference Cheat Sheet
+
+> 🔗 Related: [kubectl Reference](#chapter-4-kubectl--complete-reference)
+
+```bash
+# ============================================
+# CLUSTER INFO
+# ============================================
+kubectl version --short
+kubectl cluster-info
+kubectl get nodes -o wide
+kubectl top nodes
+kubectl get cs                         # Component status
+kubectl api-resources | grep -v NAME  # All resource types
+
+# ============================================
+# NAMESPACE SHORTCUTS
+# ============================================
+kubectl config set-context --current --namespace=production
+alias k=kubectl
+alias kn='kubectl -n'
+
+# ============================================
+# GET EVERYTHING
+# ============================================
+kubectl get all -n production -o wide
+kubectl get pods -A --sort-by='.status.containerStatuses[0].restartCount'
+kubectl get pods -A | grep -v "Running\|Completed"    # Problem pods
+kubectl get events -A --sort-by='.lastTimestamp' | tail -30
+kubectl get events -A --field-selector type=Warning
+
+# ============================================
+# DEBUGGING
+# ============================================
+# Pod debug
+kubectl describe pod <pod> -n <ns>    # Events section dekho!
+kubectl logs <pod> --previous          # Crash ke pehle logs
+kubectl exec -it <pod> -- bash
+kubectl debug pod/<pod> -it --image=busybox --copy-to=debug-pod
+
+# Service connectivity
+kubectl run test --image=busybox --rm -it --restart=Never -- \
+  wget -qO- http://myservice:80
+kubectl get endpoints myservice        # Pod IPs dekho
+
+# DNS test
+kubectl run dns --image=busybox --rm -it --restart=Never -- \
+  nslookup myservice.production.svc.cluster.local
+
+# Resource issues
+kubectl describe node worker-1 | grep -A 10 "Allocated"
+kubectl top pods -A --sort-by=memory
+kubectl top pods -A --sort-by=cpu
+
+# ============================================
+# QUICK OPERATIONS
+# ============================================
+# Rolling restart (zero downtime)
+kubectl rollout restart deployment/myapp -n production
+
+# Scale
+kubectl scale deployment myapp --replicas=0 -n production  # Shutdown
+kubectl scale deployment myapp --replicas=3 -n production  # Startup
+
+# Update image
+kubectl set image deployment/myapp myapp=myapp:v2.0 -n production
+kubectl rollout status deployment/myapp -n production
+kubectl rollout undo deployment/myapp -n production        # Rollback
+
+# Port forward (quick access)
+kubectl port-forward svc/myapp 8080:80 -n production &
+
+# ============================================
+# COPY FILES
+# ============================================
+kubectl cp pod-name:/app/logs/ ./logs/ -n production
+kubectl cp ./local.conf pod-name:/app/config/ -n production
+
+# ============================================
+# YAML GENERATION (Dry run)
+# ============================================
+kubectl create deployment myapp --image=nginx --dry-run=client -o yaml
+kubectl create service clusterip myapp --tcp=80:80 --dry-run=client -o yaml
+kubectl create configmap myconfig --from-literal=k=v --dry-run=client -o yaml
+
+# ============================================
+# FORCE DELETE (Stuck pods)
+# ============================================
+kubectl delete pod <pod> --grace-period=0 --force -n production
+
+# ============================================
+# PRODUCTION HEALTH CHECK
+# ============================================
+# Failing pods
+kubectl get pods -A | grep -v "Running\|Completed\|Succeeded"
+
+# High restarts
+kubectl get pods -A -o json | \
+  jq '.items[] | select(.status.containerStatuses != null) |
+  .metadata.name + " " +
+  (.status.containerStatuses[0].restartCount | tostring)' | \
+  sort -t'"' -k4 -rn | head -10
+
+# Resource pressure
+kubectl get nodes -o json | \
+  jq '.items[] | .metadata.name + " " + (.status.conditions[] |
+  select(.type == "MemoryPressure" or .type == "DiskPressure") |
+  .type + "=" + .status)'
+
+# etcd health
+ETCDCTL_API=3 etcdctl endpoint health \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt \
+  --key=/etc/kubernetes/pki/etcd/healthcheck-client.key
+
+# Certificate expiry
+kubeadm certs check-expiration
+
+# ============================================
+# COMPLETE TOPICS COVERED
+# ============================================
+```
+
+| # | Chapter | Status |
+|---|---------|--------|
+| 1 | Kubernetes Overview | ✅ |
+| 2 | Architecture (Control Plane + Worker) | ✅ |
+| 3 | Installation (Minikube, Kind, kubeadm) | ✅ |
+| 4 | kubectl Complete Reference | ✅ |
+| 5 | Pods — Complete + All Probes | ✅ |
+| 6 | Init Containers & Sidecar Pattern | ✅ |
+| 7 | Labels, Selectors & Annotations | ✅ |
+| 8 | Namespaces | ✅ |
+| 9 | ReplicaSets | ✅ |
+| 10 | Deployments + Rolling Updates | ✅ |
+| 11 | Services — All 5 Types | ✅ |
+| 12 | Ingress & IngressClass + Cert-Manager | ✅ |
+| 13 | ConfigMaps & Secrets | ✅ |
+| 14 | Taints & Tolerations | ✅ |
+| 15 | Node Affinity & Pod Affinity | ✅ |
+| 16 | Resource Requests & Limits + QoS | ✅ |
+| 17 | ResourceQuota & LimitRange | ✅ |
+| 18 | PV, PVC, StorageClass | ✅ |
+| 19 | StatefulSets | ✅ |
+| 20 | DaemonSets | ✅ |
+| 21 | Jobs & CronJobs | ✅ |
+| 22 | RBAC | ✅ |
+| 23 | Service Accounts | ✅ |
+| 24 | Network Policies | ✅ |
+| 25 | HPA | ✅ |
+| 26 | VPA | ✅ |
+| 27 | Cluster Autoscaler | ✅ |
+| 28 | Pod Disruption Budget | ✅ |
+| 29 | Helm Package Manager | ✅ |
+| 30 | DNS & Service Discovery (CoreDNS) | ✅ |
+| 31 | Monitoring — Prometheus & Grafana | ✅ |
+| 32 | Logging — EFK + Loki Stack | ✅ |
+| 33 | Kubernetes Dashboard | ✅ |
+| 34 | Cluster Upgrades & Maintenance | ✅ |
+| 35 | etcd Backup & Restore | ✅ |
+| 36 | CRDs & Operators | ✅ |
+| 37 | Pod Security (PSA) | ✅ |
+| 38 | Admission Controllers | ✅ |
+| 39 | Production Checklist | ✅ |
+| 40 | Interview Q&A (12 Questions) | ✅ |
+| 41 | Quick Reference Cheat Sheet | ✅ |
+
+---
+
+> 🏠 [Back to Index](./README.md) | 🐳 [Docker Notes](./Docker-Complete-Notes.md)
+>
+> 📺 **Reference:** [Train with Subham K8s](https://youtu.be/W04brGNgxN4)
+> 📖 **TutorialsPoint:** https://www.tutorialspoint.com/kubernetes/index.htm
